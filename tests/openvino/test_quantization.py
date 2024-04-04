@@ -14,6 +14,7 @@
 
 # ruff: noqa
 
+import os
 import itertools
 import tempfile
 import unittest
@@ -620,6 +621,29 @@ class OVQuantizerQATest(unittest.TestCase):
                 self.fail("Loading BERT QA model a second time failed")
 
 
+def load_transformations(model, dir):
+    import os
+    import json
+    from copy import deepcopy
+    from nncf.common.factory import ModelTransformerFactory
+    from nncf.torch.dynamic_graph.io_handling import FillerInputInfo
+    from nncf.torch.graph.transformations.serialization import load_transformations as lt
+    from nncf.torch.nncf_network import NNCFNetwork
+
+    serialized_transformations_path = os.path.join(dir, "serialized_transformations.json")
+    with open(serialized_transformations_path, 'r') as f:
+        transforms_dict = json.load(f)
+    transformations =  lt(transforms_dict["TRANSFORMATION_STATE"])
+    input_info = FillerInputInfo.from_state(transforms_dict["INPUT_STATE"])
+
+    nncf_network = NNCFNetwork(deepcopy(model), input_info=input_info)
+    model_transformer = ModelTransformerFactory.create(nncf_network)
+    transformed_model = model_transformer.transform(transformations)
+
+    transformed_model.nncf.disable_dynamic_graph_building()
+    return transformed_model
+
+
 class OVTrainerTest(unittest.TestCase):
     SUPPORTED_ARCHITECTURES_WITH_EXPECTED_QUANTIZED_MATMULS = (("distilbert-base-uncased", 50, 38),)
 
@@ -664,6 +688,46 @@ class OVTrainerTest(unittest.TestCase):
             tokens = tokenizer("This is a sample input", return_tensors="pt")
             outputs = model(**tokens)
             self.assertTrue("logits" in outputs)
+
+    @parameterized.expand(SUPPORTED_ARCHITECTURES_WITH_EXPECTED_QUANTIZED_MATMULS)
+    def test_aware_training_quantization_model_recovery(self, model_name, expected_fake_quantize, expected_int8):
+        model = AutoModelForSequenceClassification.from_pretrained(model_name)
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
+        ov_config = OVConfig()
+        dataset = load_dataset("glue", "sst2")
+        dataset = dataset.map(
+            lambda examples: tokenizer(examples["sentence"], padding="max_length", max_length=128), batched=True
+        )
+        train_dataset = dataset["train"].select(range(16))
+        eval_dataset = dataset["validation"].select(range(16))
+        metric = evaluate.load("glue", "sst2")
+
+        def compute_metrics(p):
+            return metric.compute(predictions=np.argmax(p.predictions, axis=1), references=p.label_ids)
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            trainer = OVTrainer(
+                model=model,
+                ov_config=ov_config,
+                task="sequence-classification",
+                args=TrainingArguments(tmp_dir, num_train_epochs=1.0, do_train=True, do_eval=True),
+                train_dataset=train_dataset,
+                eval_dataset=eval_dataset,
+                compute_metrics=compute_metrics,
+                tokenizer=tokenizer,
+                data_collator=default_data_collator,
+            )
+            self.assertEqual(trainer.task, "text-classification")
+            trainer.train()
+            trainer.evaluate()
+            trainer.save_model()
+
+            model = AutoModelForSequenceClassification.from_pretrained(tmp_dir)
+            model = load_transformations(model, tmp_dir)
+
+            ckpt = torch.load(os.path.join(tmp_dir, "pytorch_model.bin"))
+            model.load_state_dict(ckpt)
+            assert len(model.nncf.external_quantizers) == expected_fake_quantize
 
 
 class InferRequestWrapperTest(unittest.TestCase):

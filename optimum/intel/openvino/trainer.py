@@ -23,6 +23,7 @@ from collections import defaultdict
 from itertools import chain
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple, Type, Union
+import json
 
 
 # Integrations must be imported before ML frameworks:
@@ -852,6 +853,34 @@ class OVTrainer(Trainer):
         logger.info(f"Saving model checkpoint to {output_dir}")
         # Save a trained model and configuration using `save_pretrained()`.
         # They can then be reloaded using `from_pretrained()`
+
+        # Save nncf transformations
+        if hasattr(self.model, "nncf"):
+            from nncf.torch.graph.transformations.serialization import serialize_transformations
+            from nncf.torch.graph.transformations.serialization import serialize_transformations
+            from nncf.torch.dynamic_graph.io_handling import FillerInputInfo
+            from nncf.torch.dynamic_graph.io_handling import FillerInputElement
+            args, kwargs = self.model.nncf._input_info.get_forward_inputs()
+            elems = []
+            def type_to_str(type_):
+                return "float" if v.dtype.is_floating_point else "long"
+
+            for arg in args:
+                elems.append(FillerInputElement(shape=list(arg.shape), type_str=type_to_str(arg.dtype)))
+            for k, v in kwargs.items():
+                elems.append(
+                    FillerInputElement(
+                        shape=list(v.shape), keyword=k, type_str=type_to_str(v.dtype)
+                    )
+                )
+
+            transformations = self.model.nncf.get_applied_transformation_layout()
+            output_dict = {
+                "TRANSFORMATION_STATE": serialize_transformations(transformations),
+                "INPUT_STATE": FillerInputInfo(elems).get_state()
+            }
+            with open(os.path.join(output_dir, "serialized_transformations.json"), "w") as out:
+                json.dump(output_dict, out)
 
         if not isinstance(self.model, PreTrainedModel):
             unwrapped_model = unwrap_model(self.model)
